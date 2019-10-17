@@ -5,7 +5,7 @@
 import * as React from "react";
 import { Id64String, OpenMode } from "@bentley/bentleyjs-core";
 import { AccessToken, ConnectClient, IModelQuery, Project, Config } from "@bentley/imodeljs-clients";
-import { IModelApp, IModelConnection, FrontendRequestContext, AuthorizedFrontendRequestContext } from "@bentley/imodeljs-frontend";
+import { IModelApp, IModelConnection, FrontendRequestContext, AuthorizedFrontendRequestContext, SpatialModelState } from "@bentley/imodeljs-frontend";
 import { Presentation, SelectionChangeEventArgs, ISelectionProvider } from "@bentley/presentation-frontend";
 import { Button, ButtonSize, ButtonType, Spinner, SpinnerSize } from "@bentley/ui-core";
 import { SignIn } from "@bentley/ui-components";
@@ -16,6 +16,7 @@ import TreeWidget from "./Tree";
 import ViewportContentControl from "./Viewport";
 import "@bentley/icons-generic-webfont/dist/bentley-icons-generic-webfont.css";
 import "./App.css";
+import { RenderMode, ModelQueryParams, ModelProps } from "@bentley/imodeljs-common";
 
 // tslint:disable: no-console
 // cSpell:ignore imodels
@@ -29,6 +30,7 @@ export interface AppState {
   offlineIModel: boolean;
   imodel?: IModelConnection;
   viewDefinitionId?: Id64String;
+  spoolData?: string[];
 }
 
 /** A component the renders the whole application UI */
@@ -89,6 +91,28 @@ export default class App extends React.Component<{}, AppState> {
     }
   }
 
+  private turnOnAllCategories(imodel: IModelConnection): any {
+    IModelApp.viewManager.onViewOpen.addOnce(async () => {
+      IModelApp.viewManager.forEachViewport((vp) => {
+        vp.onViewChanged.addOnce(async () => {
+          const selectUsedSpatialCategoryIds = "SELECT DISTINCT Category.Id as id from BisCore.GeometricElement3d WHERE Category.Id IN (SELECT ECInstanceId from BisCore.SpatialCategory)";
+          const ecsql2 = "SELECT ECInstanceId as id FROM BisCore.SpatialCategory WHERE ECInstanceId IN (" + selectUsedSpatialCategoryIds + ")";
+          const categories: string[] = [];
+          vp.view.viewFlags.renderMode = RenderMode.SmoothShade;
+          for await (const row of imodel.query(ecsql2)) categories.push(row.id);
+          for (const category of categories) vp.changeCategoryDisplay(category, true, true);
+
+          const modelQueryParams: ModelQueryParams = { from: SpatialModelState.classFullName, wantPrivate: false };
+          const curModelProps: ModelProps[] = await imodel.models.queryProps(modelQueryParams);
+          curModelProps;
+          const modelIds: Id64String[] = [];
+          for (const modelProps of curModelProps) if (modelProps.id) modelIds.push(modelProps.id as Id64String);
+          vp.addViewedModels(modelIds);
+        });
+      });
+    });
+  }
+
   private _onRegister = () => {
     window.open("https://imodeljs.github.io/iModelJs-docs-output/getting-started/#developer-registration", "_blank");
   }
@@ -128,6 +152,16 @@ export default class App extends React.Component<{}, AppState> {
     return acceptedViewSpecs[0].id!;
   }
 
+  private async getListOfSpools (imodel: IModelConnection) {
+    const query = `SELECT DISTINCT SPOOL FROM SPxReviewDynamic.P3DPipeInstrument
+      UNION SELECT DISTINCT SPOOL FROM SPxReviewDynamic.P3DPipingComponent
+      UNION SELECT DISTINCT SPOOL FROM SPxReviewDynamic.P3DPipe`;
+    const rows = [];
+    for await (const row of imodel.query(query)) rows.push(row);
+
+    return rows;
+  }
+
   /** Handle iModel open event */
   private _onIModelSelected = async (imodel: IModelConnection | undefined) => {
     if (!imodel) {
@@ -136,9 +170,12 @@ export default class App extends React.Component<{}, AppState> {
       return;
     }
     try {
+      this.turnOnAllCategories(imodel);
+      const spoolData = await this.getListOfSpools(imodel);
       // attempt to get a view definition
       const viewDefinitionId = imodel ? await this.getFirstViewDefinitionId(imodel) : undefined;
-      this.setState({ imodel, viewDefinitionId });
+      this.setState({ imodel, viewDefinitionId, spoolData });
+
     } catch (e) {
       // if failed, close the imodel and reset the state
       if (this.state.offlineIModel) {
@@ -169,10 +206,10 @@ export default class App extends React.Component<{}, AppState> {
     } else if (!this.state.imodel || !this.state.viewDefinitionId) {
       // if we don't have an imodel / view definition id - render a button that initiates imodel open
       ui = (<OpenIModelButton accessToken={this.state.user.accessToken} offlineIModel={this.state.offlineIModel} onIModelSelected={this._onIModelSelected} />);
-    } else {
+    } else if (this.state.spoolData) {
       // if we do have an imodel and view definition id - render imodel components
-      ui = (<IModelComponents imodel={this.state.imodel} viewDefinitionId={this.state.viewDefinitionId} />);
-    }
+      ui = (<IModelComponents imodel={this.state.imodel} viewDefinitionId={this.state.viewDefinitionId} spoolData={this.state.spoolData} />);
+    } else throw new Error("Cannot find SPOOL data in iModel.");
 
     // render the app
     return (
@@ -261,6 +298,7 @@ class OpenIModelButton extends React.PureComponent<OpenIModelButtonProps, OpenIM
 interface IModelComponentsProps {
   imodel: IModelConnection;
   viewDefinitionId: Id64String;
+  spoolData: string[];
 }
 /** Renders a viewport, a tree, a property grid and a table */
 class IModelComponents extends React.PureComponent<IModelComponentsProps> {
@@ -282,7 +320,7 @@ class IModelComponents extends React.PureComponent<IModelComponentsProps> {
           </div>
         </div>
         <div className="bottom">
-          <GridWidget imodel={this.props.imodel} rulesetId={rulesetId} />
+          <GridWidget imodel={this.props.imodel} data={this.props.spoolData} />
         </div>
       </div>
     );

@@ -3,51 +3,102 @@
 * Licensed under the MIT License. See LICENSE.md in the project root for license terms.
 *--------------------------------------------------------------------------------------------*/
 import * as React from "react";
-import { IModelConnection } from "@bentley/imodeljs-frontend";
-import { Table } from "@bentley/ui-components";
-import {
-  IPresentationTableDataProvider,
-  PresentationTableDataProvider,
-  tableWithUnifiedSelection,
-} from "@bentley/presentation-components";
+import { Table, SimpleTableDataProvider, ColumnDescription, RowItem, SelectionMode } from "@bentley/ui-components";
+import { PropertyRecord, PropertyValue, PropertyValueFormat, PropertyDescription, IModelConnection, IModelApp } from "@bentley/imodeljs-frontend";
+import { PipeFeatureOverrideProvider } from "./PipeFeatureOverrideProvider";
+import { fitView } from "./Toolbar";
 
-// create a HOC table component that supports unified selection
-// tslint:disable-next-line:variable-name
-const SimpleTable = tableWithUnifiedSelection(Table);
-
-/** React properties for the table component, that accepts an iModel connection with ruleset id */
-export interface IModelConnectionProps {
-  /** iModel whose contents should be displayed in the table */
-  imodel: IModelConnection;
-  /** ID of the presentation rule set to use for creating the content displayed in the table */
-  rulesetId: string;
-}
-
-/** React properties for the table component, that accepts a data provider */
-export interface DataProviderProps {
+export interface Props {
   /** Custom property pane data provider. */
-  dataProvider: IPresentationTableDataProvider;
+  data: any[];
+  imodel: IModelConnection;
 }
-
-/** React properties for the table component */
-export type Props = IModelConnectionProps | DataProviderProps;
 
 /** Table component for the viewer app */
 export default class SimpleTableComponent extends React.PureComponent<Props> {
-  private getDataProvider(props: Props) {
-    if ((props as any).dataProvider) {
-      const providerProps = props as DataProviderProps;
-      return providerProps.dataProvider;
-    } else {
-      const imodelProps = props as IModelConnectionProps;
-      return new PresentationTableDataProvider({ imodel: imodelProps.imodel, ruleset: imodelProps.rulesetId });
+
+  private _spools: string[] = [];
+
+  private async _updateViewport() {
+
+    let spoolList = "(";
+    const count = this._spools.length;
+    // prepare list of component ids
+    this._spools.forEach((value: any, index: number) => {
+      spoolList += "'" + value + "'";
+      spoolList += (++index !== count) ? ", " : ")";
+    });
+
+    const query = `SELECT ECInstanceId AS id FROM SPxReviewDynamic.P3DPipe
+      WHERE Spool IN ${spoolList}
+      UNION SELECT ECInstanceId AS id FROM SPxReviewDynamic.P3DPipeInstrument
+      WHERE Spool IN ${spoolList}
+      UNION SELECT ECInstanceId AS id FROM SPxReviewDynamic.P3DPipingComponent
+      WHERE Spool IN ${spoolList}`;
+
+    const elements = [];
+    if (this._spools.length > 0) for await (const row of this.props.imodel.query(query)) elements.push(row.id);
+    const vp = IModelApp.viewManager.selectedView!;
+    vp.featureOverrideProvider = new PipeFeatureOverrideProvider(elements);
+
+    // if spools are selected, zoom in on those elements. else zoom into the entire model.
+    this._spools.length > 0 ? vp.zoomToElements(elements) : fitView();
+  }
+
+  private _onRowsSelected = async (rowIterator: AsyncIterableIterator<RowItem>) => {
+
+    let row = await rowIterator.next();
+
+    while (!row.done) {
+      const spoolID = (row.value.cells[0].record!.value as any).value;
+      this._spools.push(spoolID);
+      row = await rowIterator.next();
     }
+
+    this._updateViewport();
+
+    return Promise.resolve(true);
+  }
+
+  private _onRowsDeselected = async (rowIterator: AsyncIterableIterator<RowItem>) => {
+
+    let row = await rowIterator.next();
+
+    while (!row.done) {
+      const spoolID = (row.value.cells[0].record!.value as any).value;
+      const index = this._spools.indexOf(spoolID);
+      this._spools.splice(index, 1);
+      row = await rowIterator.next();
+    }
+
+    this._updateViewport();
+
+    return Promise.resolve(true);
+  }
+
+  private _getDataProvider = (): SimpleTableDataProvider => {
+
+    const columns: ColumnDescription[] = [];
+
+    columns.push({key: "spool_id", label: "SPOOL ID" });
+
+    const dataProvider: SimpleTableDataProvider = new SimpleTableDataProvider(columns);
+
+    this.props.data.forEach((rowValue: any, index) => {
+      const rowItem: RowItem = {key: index.toString(), cells: []};
+      const value: PropertyValue = {valueFormat: PropertyValueFormat.Primitive, value: rowValue.spool};
+      const description: PropertyDescription = {displayLabel: columns[0].label, name: columns[0].key, typename: "string"};
+      rowItem.cells.push({key: columns[0].key, record: new PropertyRecord(value, description)});
+      dataProvider.addRow(rowItem);
+    });
+
+    return dataProvider;
   }
 
   public render() {
     return (
       <div style={{ height: "100%" }}>
-        <SimpleTable dataProvider={this.getDataProvider(this.props)} />
+        <Table dataProvider={this._getDataProvider()} selectionMode={SelectionMode.Multiple} onRowsSelected={this._onRowsSelected} onRowsDeselected={this._onRowsDeselected}/>
       </div>
     );
   }
